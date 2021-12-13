@@ -9,7 +9,7 @@ interface
 uses
   {$IFDEF WINDOWS} windows {$ELSE} Unix {$ENDIF},
   Classes, sysutils,
-  fpredis_api, fpredis_read, fgl, Variants;
+  fpredis_api, fpredis_read, fgl, Variants, LConvEncoding;
 
 type
 
@@ -23,6 +23,7 @@ type
 
   TFPRedis = class(TObject)
   private
+    FConnected: Boolean;
     FHost: string;
     FPort: Integer;
     FAuth: string;
@@ -40,10 +41,13 @@ type
     function replyArrayString(const reply: PRedisReply): TStringArray;
 
   public
+    constructor Create;
     constructor Create(host: string; port: Integer; auth: string = ''; database: Integer = 0);
     destructor Destroy; override;
     function Connect(): Boolean;
-
+    function Connect(host: string; port: Integer; auth: string = ''; database: Integer = 0): Boolean;
+    procedure Disconnect();
+    function Info(AKey: string): string;
     function Select(ADatabase: Integer): Boolean;
     function Get(AKey: String): String;
     function &Set(AKey: String; AValue: String): Boolean;
@@ -60,6 +64,8 @@ type
     function Pttl(AKey: string): Int64;
     function SetBit(AKey: string; AOffset: Int64; AValue: Boolean): Boolean;
     function GetBit(AKey: string; AOffset: Int64): Boolean;
+    function GetAllBits(AKey: string): TBytes;
+    procedure GetStringOrBytes(AKey: String; out Str: String; out Bytes: TBytes);
     function Unlink(AKey: string): Int64;
     function Move(AKey: string; ADBIndex: Integer): Int64;
     function GetSet(AKey: String; AValue: string): String;
@@ -127,6 +133,7 @@ type
     function ZAdd(AKey: string; AScore: Double; AMember: string): Int64;
     function ZAdd(AKey: string; AMap: TFPZScoreMap): Int64;
     function ZRange(AKey: string; AStart: Int64; AStop: Int64): TStringArray;
+    function ZRangeWithScore(AKey: string; AStart: Int64; AStop: Int64): TFPZScoreMap;
     function ZRem(AKey: string; AMembers: TStringArray): Int64;
     function ZCount(AKey: string; AMin: Double; AMax: Double): Int64;
     function ZCount(AKey: string; AMin: String; AMax: String): Int64;
@@ -137,7 +144,10 @@ type
     function ZRevRange(AKey: string; AMember: string): TStringArray;
     function ZScore(AKey: string; AMember: string): Double;
 
+    function Scan(ACursor: Int64): TStringArray;
+
   public
+    property Connected: Boolean read FConnected;
     property LastError: string read FLastError;
   end;
 
@@ -147,7 +157,7 @@ implementation
 
 procedure TFPRedis.processError(const reply: PRedisReply);
 begin
-  FLastError:= reply^.str;
+  FLastError:= string(reply^.str);
   {$IFNDEF WINDOWS}
   WriteLn(FLastError);
   {$ENDIF}
@@ -245,6 +255,16 @@ begin
   freeReplyObject(reply);
 end;
 
+constructor TFPRedis.Create;
+begin
+  FHost:= '127.0.0.1';
+  FPort:= 6379;
+  FAuth:= '';
+  FDatabase:= 0;
+  FLastError:= '';
+  FCtx:= nil;
+end;
+
 constructor TFPRedis.Create(host: string; port: Integer; auth: string;
   database: Integer);
 begin
@@ -268,21 +288,57 @@ function TFPRedis.Connect(): Boolean;
 var
   reply: PRedisReply;
 begin
+  if (FCtx <> nil) then begin
+    redisFree(FCtx);
+    FCtx:= nil;
+  end;
   FCtx:= redisConnect(PChar(FHost), 26379);
   if (FCtx^.err <> REDIS_OK) then begin
-    FLastError:= 'Connect Error: %s'.format([FCtx^.errstr]);
+    FLastError:= 'Connect Error: %s'.format([string(FCtx^.errstr)]);
+    FConnected:= False;
+    redisFree(FCtx);
+    FCtx:= nil;
     Exit(False);
   end;
   if (FAuth <> '') then begin
     reply:= redisCommand(FCtx, 'AUTH %s', [PChar(FAuth)]);
     Result := reply^._type <> REDIS_REPLY_ERROR;
     if (not Result) then begin
-      FLastError:= 'Auth Failed: %s'.Format([reply^.str]);
+      FLastError:= 'Auth Failed: %s'.Format([string(reply^.str)]);
     end else begin
       Result := Select(FDatabase);
     end;
     freeReplyObject(reply);
   end;
+  FConnected:= Result;
+end;
+
+function TFPRedis.Connect(host: string; port: Integer; auth: string;
+  database: Integer): Boolean;
+begin
+  FHost:= host;
+  FPort:= port;
+  FAuth:= auth;
+  FDatabase:= database;
+  Result := Connect();
+end;
+
+procedure TFPRedis.Disconnect();
+begin
+  FConnected := False;
+  if (FCtx <> nil) then begin
+    redisFree(FCtx);
+    FCtx:= nil;
+  end;
+end;
+
+function TFPRedis.Info(AKey: string): string;
+var
+  reply: PRedisReply;
+begin
+  if (FCtx = nil) then raise TFPRedisExeception.Create('Not connected to Redis Server.');
+  reply:= redisCommand(FCtx, 'INFO %s', [PChar(AKey)]);
+  Result := replyString(reply);
 end;
 
 function TFPRedis.Select(ADatabase: Integer): Boolean;
@@ -427,6 +483,42 @@ begin
   if (FCtx = nil) then raise TFPRedisExeception.Create('Not connected to Redis Server.');
   reply:= redisCommand(FCtx, 'GETBIT %s %d', [PChar(AKey), AOffset]);
   Result := replyInteger1(reply);
+end;
+
+function TFPRedis.GetAllBits(AKey: string): TBytes;
+var
+  reply: PRedisReply;
+  i: Integer;
+begin
+  reply:= redisCommand(FCtx, 'GET %s', [PChar(AKey)]);
+  SetLength(Result, reply^.len);
+  for i :=0 to reply^.len - 1 do begin
+    Result[i] := Integer(reply^.str[i]);
+  end;
+  freeReplyObject(reply);
+end;
+
+procedure TFPRedis.GetStringOrBytes(AKey: String; out Str: String; out Bytes: TBytes);
+var
+  reply: PRedisReply;
+  i: Integer;
+begin
+  if (FCtx = nil) then raise TFPRedisExeception.Create('Not connected to Redis Server.');
+  reply:= redisCommand(FCtx, 'GET %s', [PChar(AKey)]);
+
+  if (reply^._type = REDIS_REPLY_STRING) then begin
+    SetLength(Bytes, reply^.len);
+    for i:= 0 to reply^.len - 1 do begin
+      Bytes[i] := Integer(reply^.str[i]);
+    end;
+    str := '';
+    for i:= 0 to reply^.len - 1 do begin
+      str += Char(Bytes[i]);
+    end;
+  end else begin
+    processError(reply);
+  end;
+  freeReplyObject(reply);
 end;
 
 function TFPRedis.Unlink(AKey: string): Int64;
@@ -1103,6 +1195,23 @@ begin
   Result := replyArrayString(reply);
 end;
 
+function TFPRedis.ZRangeWithScore(AKey: string; AStart: Int64; AStop: Int64
+  ): TFPZScoreMap;
+var
+  reply: PRedisReply;
+  len: Int64;
+  i: Int64;
+begin
+  if (FCtx = nil) then raise TFPRedisExeception.Create('Not connected to Redis Server.');
+  reply:= redisCommand(FCtx, 'ZRANGE %s %d %d WITHSCORES', [PChar(AKey), AStart, AStop]);
+  Result := TFPZScoreMap.Create;
+  len := reply^.elements;
+  for i:= 0 to (len div 2) - 1 do begin
+    Result.Add(string(reply^.element[i * 2]^.str), string(reply^.element[i * 2 + 1]^.str).ToDouble);
+  end;
+  freeReplyObject(reply);
+end;
+
 function TFPRedis.ZRem(AKey: string; AMembers: TStringArray): Int64;
 var
   reply: PRedisReply;
@@ -1190,6 +1299,20 @@ begin
   if (FCtx = nil) then raise TFPRedisExeception.Create('Not connected to Redis Server.');
   reply:= redisCommand(FCtx, 'ZSCORE %s %s', [PChar(AKey), PChar(AMember)]);
   Result := replyDoubleV(reply);
+end;
+
+function TFPRedis.Scan(ACursor: Int64): TStringArray;
+var
+  reply: PRedisReply;
+  i: Integer;
+begin
+  if (FCtx = nil) then raise TFPRedisExeception.Create('Not connected to Redis Server.');
+  reply := redisCommand(FCtx, 'SCAN %d MATCH * COUNT 10000', [ACursor]);
+  SetLength(Result, reply^.element[1]^.elements);
+  for i:= 0 to Length(Result) - 1 do begin
+    Result[i] := string(reply^.element[1]^.element[i]^.str);
+  end;
+  freeReplyObject(reply);
 end;
 
 end.
